@@ -23,6 +23,7 @@ class Module {
   void provide_command(
       CommandMeta meta,
       rust::Fn<JsonBlob(const CommandMeta&, JsonBlob)> command_handler) const;
+  void publish_variable( rust::Str implementation_id, rust::Str name, JsonBlob blob) const;
 
   // TODO(hrapp): Add call_command, publish_variable and subscribe_variable.
 

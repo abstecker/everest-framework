@@ -76,6 +76,12 @@ void Module::provide_command(
                        });
 }
 
+void Module::publish_variable(rust::Str implementation_id, rust::Str name,
+                              JsonBlob blob) const {
+  handle_->publish_var(std::string(implementation_id), std::string(name),
+                       json::parse(blob.data.begin(), blob.data.end()));
+}
+
 std::unique_ptr<Module> create_module(rust::Str module_id, rust::Str prefix,
                                       rust::Str conf) {
   return std::make_unique<Module>(std::string(module_id), std::string(prefix),

@@ -1,7 +1,7 @@
 mod schema;
 
 use argh::FromArgs;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 use std::os::raw::c_char;
 use std::path::PathBuf;
@@ -62,6 +62,9 @@ mod ffi {
             meta: CommandMeta,
             on_ready: unsafe fn(&CommandMeta, JsonBlob) -> JsonBlob,
         );
+
+        /// Publishes the given `blob` under the `implementation_id` and `name`.
+        fn publish_variable(self: &Module, implementation_id: &str, name: &str, blob: JsonBlob);
     }
 }
 
@@ -162,14 +165,47 @@ impl<T: GenericModule> Runtime<T> {
                 unsafe {
                     module.cpp_module.as_ref().unwrap().provide_command(
                         meta,
-                        |meta: &ffi::CommandMeta, params: ffi::JsonBlob| {
+                        |meta: &ffi::CommandMeta, blob: ffi::JsonBlob| {
                             let module_impl = &mut *(meta.obj as *mut T);
                             let out = match module_impl.handle_command(
                                 &meta.implementation_id,
                                 &meta.name,
-                                params.deserialize(),
+                                blob.deserialize(),
                             ) {
                                 Err(e) => panic!("Error calling command: {e:?}"),
+                                Ok(out) => out,
+                            };
+                            ffi::JsonBlob::from_vec(serde_json::to_vec(&out).unwrap())
+                        },
+                    );
+                }
+            }
+        }
+
+        // Subscribe to all variables that might be of interest.
+        // TODO(sirver): This looks very similar to the block above.
+        for (implementation_id, provides) in manifest.requires {
+            let interface_s = module.cpp_module.get_interface(&provides.interface);
+            let interface: schema::Interface = interface_s.deserialize();
+            for (name, _) in interface.vars {
+                // NOCOM(#sirver): Look into misc.cpp, create_setup_from_config to get the right
+                // connections here.
+                let meta = ffi::CommandMeta {
+                    implementation_id: implementation_id.clone(),
+                    name,
+                    obj: module.ptr_to_module_impl(),
+                };
+                unsafe {
+                    module.cpp_module.as_ref().unwrap().subscribe_variable(
+                        meta,
+                        |meta: &ffi::CommandMeta, params: ffi::JsonBlob| {
+                            let module_impl = &mut *(meta.obj as *mut T);
+                            let out = match module_impl.handle_variable(
+                                &meta.implementation_id,
+                                &meta.name,
+                                params.deserialize(),
+                            ) {
+                                Err(e) => panic!("Error receiving variable: {e:?}"),
                                 Ok(out) => out,
                             };
                             ffi::JsonBlob::from_vec(serde_json::to_vec(&out).unwrap())
@@ -192,5 +228,15 @@ impl<T: GenericModule> Runtime<T> {
         }
 
         module
+    }
+
+    pub fn publish_variable(&mut self, impl_id: &str, var_name: &str, data: &impl Serialize) {
+        let blob = ffi::JsonBlob::from_vec(
+            serde_json::to_vec(data).expect("Serialization of data cannot fail."),
+        );
+        self.cpp_module
+            .as_ref()
+            .unwrap()
+            .publish_variable(impl_id, var_name, blob);
     }
 }
