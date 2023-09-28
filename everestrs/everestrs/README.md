@@ -26,4 +26,6 @@ This is Rust support using cxx.rs to wrap the framework C++ library.
 
 ## Status
 
+NOCOM(#sirver): Update, this is no longer accurate.
+
 This code is currently only supporting providing an interface to be implemented, i.e. no variables publish or receiving and no calling of other interfaces. Those features are straightforward, quick and easy to implement, but for now this is probably enough to iron out the integration questions.
