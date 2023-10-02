@@ -74,7 +74,15 @@ void Module::subscribe_variable(const Runtime& rt, const CommandMeta& meta) cons
     });
 }
 
-std::unique_ptr<Module> create_module(rust::Str module_id, rust::Str prefix, rust::Str conf) {
+JsonBlob Module::call_command(rust::Str implementation_id, rust::Str name, JsonBlob blob) const {
+	// TODO(sirver): I am not sure how to model the multiple slots that could theoretically be here.
+	const Requirement req(std::string(implementation_id), 0);
+	json return_value = handle_->call_cmd(req, std::string(name), json::parse(blob.data.begin(), blob.data.end()));
+
+	return json2blob(return_value);
+}
+
+std::shared_ptr<Module> create_module(rust::Str module_id, rust::Str prefix, rust::Str conf) {
     return std::make_unique<Module>(std::string(module_id), std::string(prefix), std::string(conf));
 }
 

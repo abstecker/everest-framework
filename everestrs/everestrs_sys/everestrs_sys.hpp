@@ -20,10 +20,9 @@ public:
 
     void signal_ready(const Runtime& rt) const;
     void provide_command(const Runtime& rt, const CommandMeta& meta) const;
+	 JsonBlob call_command(rust::Str implementation_id, rust::Str name, JsonBlob args) const;
 	 void subscribe_variable(const Runtime& rt, const CommandMeta& meta) const;
-	 void publish_variable( rust::Str implementation_id, rust::Str name, JsonBlob blob) const;
-
-    // TODO(hrapp): Add call_command and subscribe_variable.
+	 void publish_variable(rust::Str implementation_id, rust::Str name, JsonBlob blob) const;
 
 private:
     const std::string module_id_;
@@ -32,4 +31,4 @@ private:
     std::unique_ptr<Everest::Everest> handle_;
 };
 
-std::unique_ptr<Module> create_module(rust::Str module_name, rust::Str prefix, rust::Str conf);
+std::shared_ptr<Module> create_module(rust::Str module_name, rust::Str prefix, rust::Str conf);
