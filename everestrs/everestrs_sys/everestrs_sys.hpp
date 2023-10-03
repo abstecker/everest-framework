@@ -31,4 +31,4 @@ private:
     std::unique_ptr<Everest::Everest> handle_;
 };
 
-std::shared_ptr<Module> create_module(rust::Str module_name, rust::Str prefix, rust::Str conf);
+std::unique_ptr<Module> create_module(rust::Str module_name, rust::Str prefix, rust::Str conf);

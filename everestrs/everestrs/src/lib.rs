@@ -1,7 +1,7 @@
 mod schema;
 
 use argh::FromArgs;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -40,11 +40,11 @@ mod ffi {
         include!("everestrs_sys/everestrs_sys.hpp");
 
         type Module;
-        fn create_module(module_id: &str, prefix: &str, conf: &str) -> SharedPtr<Module>;
+        fn create_module(module_id: &str, prefix: &str, conf: &str) -> UniquePtr<Module>;
 
         /// Connects to the message broker and launches the main everest thread to push work
         /// forward. Returns the module manifest.
-        fn initialize(self: &Module) -> JsonBlob;
+        fn initialize(self: Pin<&mut Module>) -> JsonBlob;
 
         /// Returns the interface definition.
         fn get_interface(self: &Module, interface_name: &str) -> JsonBlob;
@@ -58,7 +58,12 @@ mod ffi {
         fn provide_command(self: &Module, rt: &Runtime, meta: &CommandMeta);
 
         /// Call the command described by 'meta' with the given 'args'. Returns the return value.
-        fn call_command(self: &Module, implementation_id: &str, name: &str, args: JsonBlob) -> JsonBlob;
+        fn call_command(
+            self: &Module,
+            implementation_id: &str,
+            name: &str,
+            args: JsonBlob,
+        ) -> JsonBlob;
         /// Informs the runtime that we want to receive the variable described in `meta` and registers the
         /// `handle_variable` method from the `GenericModule` as the handler.
         fn subscribe_variable(self: &Module, rt: &Runtime, meta: &CommandMeta);
@@ -105,13 +110,12 @@ struct Args {
 /// details of the current module, i.e. it deals with JSON blobs and strings as command names. Code
 /// generation is used to build the concrete, strongly typed abstractions that are then used by
 /// final implementors.
-// NOCOM(#sirver): This should be Sync, but I did not find how. It is used by everest from multiple
-// threads, so it must be sync.
-pub trait GenericModule {
+pub trait Subscriber: Sync {
     /// Handler for the command `name` on `implementation_id` with the given `parameters`. The return value
     /// will be returned as the result of the call.
     fn handle_command(
         &self,
+        rt: &Runtime,
         implementation_id: &str,
         name: &str,
         parameters: HashMap<String, serde_json::Value>,
@@ -120,6 +124,7 @@ pub trait GenericModule {
     /// Handler for the variable `name` on `implementation_id` with the given `value`.
     fn handle_variable(
         &self,
+        rt: &Runtime,
         implementation_id: &str,
         name: &str,
         value: serde_json::Value,
@@ -128,23 +133,34 @@ pub trait GenericModule {
     fn on_ready(&self) {}
 }
 
-#[derive(Clone)]
-pub struct RawPublisher {
-    cpp_module: cxx::SharedPtr<ffi::Module>,
+pub trait Publisher: Sync {
+    fn publish_variable<T: serde::Serialize>(&self, impl_id: &str, var_name: &str, message: &T);
+
+    fn call_command<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        impl_id: &str,
+        name: &str,
+        args: &T,
+    ) -> R;
 }
 
-impl RawPublisher {
-    pub fn publish_variable(&self, impl_id: &str, var_name: &str, data: &impl Serialize) {
+impl Publisher for Runtime {
+    fn publish_variable<T: serde::Serialize>(&self, impl_id: &str, var_name: &str, message: &T) {
         let blob = ffi::JsonBlob::from_vec(
-            serde_json::to_vec(data).expect("Serialization of data cannot fail."),
+            serde_json::to_vec(&message).expect("Serialization of data cannot fail."),
         );
         (self.cpp_module)
             .as_ref()
             .unwrap()
             .publish_variable(impl_id, var_name, blob);
     }
-   
-    pub fn call_command(&self, impl_id: &str, name: &str, args: &impl Serialize) -> serde_json::Value {
+
+    fn call_command<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        impl_id: &str,
+        name: &str,
+        args: &T,
+    ) -> R {
         let blob = ffi::JsonBlob::from_vec(
             serde_json::to_vec(args).expect("Serialization of data cannot fail."),
         );
@@ -152,61 +168,71 @@ impl RawPublisher {
             .as_ref()
             .unwrap()
             .call_command(impl_id, name, blob);
-        return_value.deserialize()
+        serde_json::from_slice(&return_value.data).unwrap()
     }
 }
 
 pub struct Runtime {
     // There are two subtleties here:
-    // 1. We are handing out pointers to `module_impl` to `cpp_module` for callbacks. The pointers
-    //    must must stay valid for as long as `cpp_module` is alive. Hence `module_impl` must never
+    // 1. We are handing out pointers to `sub_impl` to `cpp_module` for callbacks. The pointers
+    //    must must stay valid for as long as `cpp_module` is alive. Hence `sub_impl` must never
     //    move in memory. Rust can model this through the Pin concept which upholds this guarantee.
     //    We use a Box to put the object on the heap.
-    // 2. For the same reason, `module_impl` should outlive `cpp_module`, hence should be dropped
+    // 2. For the same reason, `sub_impl` should outlive `cpp_module`, hence should be dropped
     //    after it. Rust drops fields in declaration order, hence `cpp_module` should come before
-    //    `module_impl` in this struct.
-    cpp_module: cxx::SharedPtr<ffi::Module>,
-    module_impl: Pin<Box<dyn GenericModule>>,
+    //    `sub_impl` in this struct.
+    cpp_module: cxx::UniquePtr<ffi::Module>,
+    sub_impl: Box<dyn Subscriber>,
 }
+
+/// The cpp_module is for Rust an opaque type - so Rust can't tell if it is safe
+/// to be accessed from multiple threads. We know that the c++ runtime is meant
+/// to be used concurrently.
+unsafe impl Sync for ffi::Module {}
 
 impl Runtime {
     fn on_ready(&self) {
-        self.module_impl.on_ready();
+        self.sub_impl.on_ready();
     }
 
     fn handle_command(&self, meta: &ffi::CommandMeta, json: ffi::JsonBlob) -> ffi::JsonBlob {
         let blob = self
-            .module_impl
-            .handle_command(&meta.implementation_id, &meta.name, json.deserialize())
+            .sub_impl
+            .handle_command(
+                &self,
+                &meta.implementation_id,
+                &meta.name,
+                json.deserialize(),
+            )
             .unwrap();
         ffi::JsonBlob::from_vec(serde_json::to_vec(&blob).unwrap())
     }
 
     fn handle_variable(&self, meta: &ffi::CommandMeta, json: ffi::JsonBlob) {
-        self.module_impl
-            .handle_variable(&meta.implementation_id, &meta.name, json.deserialize())
+        self.sub_impl
+            .handle_variable(
+                &self,
+                &meta.implementation_id,
+                &meta.name,
+                json.deserialize(),
+            )
             .unwrap();
     }
 
     // TODO(hrapp): This function could use some error handling.
-    pub fn from_commandline<T: GenericModule + 'static>(init_module: impl FnOnce(RawPublisher) -> T) -> Self {
+    pub fn from_commandline(sub_impl: Box<dyn Subscriber>) -> Self {
         let args: Args = argh::from_env();
-        let cpp_module = ffi::create_module(
+        let mut cpp_module = ffi::create_module(
             &args.module,
             &args.prefix.to_string_lossy(),
             &args.conf.to_string_lossy(),
         );
-        let manifest_json = cpp_module.as_ref().unwrap().initialize();
+        let manifest_json = cpp_module.as_mut().unwrap().initialize();
         let manifest: schema::Manifest = manifest_json.deserialize();
-
-        let raw_publisher = RawPublisher {
-            cpp_module: cpp_module.clone(),
-        };
-        let module_impl = init_module(raw_publisher);
 
         let module = Self {
             cpp_module,
-            module_impl: Box::pin(module_impl),
+            sub_impl,
         };
 
         // Implement all commands for all of our implementations, dispatch everything to the
@@ -220,8 +246,7 @@ impl Runtime {
                     name,
                 };
 
-                (module
-                    .cpp_module)
+                (module.cpp_module)
                     .as_ref()
                     .unwrap()
                     .provide_command(&module, &meta);
@@ -241,8 +266,7 @@ impl Runtime {
                     name,
                 };
 
-                (module
-                    .cpp_module)
+                (module.cpp_module)
                     .as_ref()
                     .unwrap()
                     .subscribe_variable(&module, &meta);
@@ -255,5 +279,70 @@ impl Runtime {
         (module.cpp_module).as_ref().unwrap().signal_ready(&module);
         module
     }
+}
 
+mod generated {
+    use super::Publisher;
+    use super::Result;
+    use super::Runtime;
+    use std::sync::Arc;
+    pub struct ExamplePublisher<'a> {
+        runtime: &'a Runtime,
+        name: &'a str,
+    }
+
+    impl<'a> ExamplePublisher<'a> {
+        pub fn uses_something(&self, message: u8) -> Result<()> {
+            self.runtime
+                .publish_variable(&self.name, "uses_something", &message);
+            Ok(())
+        }
+    }
+
+    pub trait ExampleSubscriber: Sync + Send {
+        fn my_callback(&self, pub_impl: &ExamplePublisher, message: u8) -> Result<String>;
+    }
+
+    struct Subscriber {
+        their_example: Arc<dyn ExampleSubscriber>,
+        another_example: Arc<dyn ExampleSubscriber>,
+    }
+
+    impl super::Subscriber for Subscriber {
+        fn handle_command(
+            &self,
+            rt: &Runtime,
+            implementation_id: &str,
+            name: &str,
+            parameters: std::collections::HashMap<String, serde_json::Value>,
+        ) -> Result<serde_json::Value> {
+            match name {
+                "their_example" => {
+                    let pub_impl = ExamplePublisher {
+                        runtime: rt,
+                        name: "their_example",
+                    };
+                    let message = 1;
+                    self.their_example.my_callback(&pub_impl, message).unwrap();
+                    todo!()
+                }
+                "another_example" => {
+                    todo!()
+                }
+                _ => {
+                    panic!("this is bad")
+                }
+            }
+        }
+
+        fn handle_variable(
+            &self,
+            rt: &Runtime,
+            implementation_id: &str,
+            name: &str,
+            value: serde_json::Value,
+        ) -> Result<()> {
+            todo!()
+        }
+    }
 }
