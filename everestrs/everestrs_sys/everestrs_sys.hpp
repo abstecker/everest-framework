@@ -15,7 +15,7 @@ class Module {
 public:
     Module(const std::string& module_id, const std::string& prefix, const std::string& conf);
 
-    JsonBlob initialize();
+    JsonBlob initialize() const;
     JsonBlob get_interface(rust::Str interface_name) const;
 
     void signal_ready(const Runtime& rt) const;

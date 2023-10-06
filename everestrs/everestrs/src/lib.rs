@@ -4,7 +4,7 @@ use argh::FromArgs;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::pin::Pin;
+use std::sync::{Arc, Weak};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -13,6 +13,8 @@ pub enum Error {
     MissingArgument(&'static str),
     #[error("invalid argument to command call: '{0}'")]
     InvalidArgument(&'static str),
+    #[error("internal Error")]
+    Internal,
 }
 
 pub type Result<T> = ::std::result::Result<T, Error>;
@@ -44,7 +46,7 @@ mod ffi {
 
         /// Connects to the message broker and launches the main everest thread to push work
         /// forward. Returns the module manifest.
-        fn initialize(self: Pin<&mut Module>) -> JsonBlob;
+        fn initialize(self: &Module) -> JsonBlob;
 
         /// Returns the interface definition.
         fn get_interface(self: &Module, interface_name: &str) -> JsonBlob;
@@ -88,8 +90,14 @@ impl ffi::JsonBlob {
     }
 }
 
+/// The cpp_module is for Rust an opaque type - so Rust can't tell if it is safe
+/// to be accessed from multiple threads. We know that the c++ runtime is meant
+/// to be used concurrently.
+unsafe impl Sync for ffi::Module {}
+unsafe impl Send for ffi::Module {}
+
+/// Arguments for an EVerest node.
 #[derive(FromArgs, Debug)]
-/// An everest Node.
 struct Args {
     /// prefix of installation.
     #[argh(option)]
@@ -110,12 +118,11 @@ struct Args {
 /// details of the current module, i.e. it deals with JSON blobs and strings as command names. Code
 /// generation is used to build the concrete, strongly typed abstractions that are then used by
 /// final implementors.
-pub trait Subscriber: Sync {
+pub trait Subscriber: Sync + Send {
     /// Handler for the command `name` on `implementation_id` with the given `parameters`. The return value
     /// will be returned as the result of the call.
     fn handle_command(
         &self,
-        rt: &Runtime,
         implementation_id: &str,
         name: &str,
         parameters: HashMap<String, serde_json::Value>,
@@ -124,7 +131,6 @@ pub trait Subscriber: Sync {
     /// Handler for the variable `name` on `implementation_id` with the given `value`.
     fn handle_variable(
         &self,
-        rt: &Runtime,
         implementation_id: &str,
         name: &str,
         value: serde_json::Value,
@@ -133,19 +139,47 @@ pub trait Subscriber: Sync {
     fn on_ready(&self) {}
 }
 
-pub trait Publisher: Sync {
-    fn publish_variable<T: serde::Serialize>(&self, impl_id: &str, var_name: &str, message: &T);
-
-    fn call_command<T: serde::Serialize, R: serde::de::DeserializeOwned>(
-        &self,
-        impl_id: &str,
-        name: &str,
-        args: &T,
-    ) -> R;
+/// The [Runtime] is the central piece of the bridge between c++ and Rust. We
+/// have to ensure that the `cpp_module` never outlives the [Runtime] object.
+/// This means that the [Runtime] **must** take ownership of `cpp_module`.
+///
+/// The `Subscriber` is not owned by the [Runtime] - in fact in derived user
+/// code the `Subscriber` might take ownership of the [Runtime] - the weak
+/// ownership hence is necessary to break possible ownership cycles.
+pub struct Runtime {
+    cpp_module: cxx::UniquePtr<ffi::Module>,
+    sub_impl: Option<Weak<dyn Subscriber>>,
 }
 
-impl Publisher for Runtime {
-    fn publish_variable<T: serde::Serialize>(&self, impl_id: &str, var_name: &str, message: &T) {
+impl Runtime {
+    fn get_sub(&self) -> Arc<dyn Subscriber> {
+        self.sub_impl.as_ref().unwrap().upgrade().unwrap()
+    }
+
+    fn on_ready(&self) {
+        self.get_sub().on_ready();
+    }
+
+    fn handle_command(&self, meta: &ffi::CommandMeta, json: ffi::JsonBlob) -> ffi::JsonBlob {
+        let blob = self
+            .get_sub()
+            .handle_command(&meta.implementation_id, &meta.name, json.deserialize())
+            .unwrap();
+        ffi::JsonBlob::from_vec(serde_json::to_vec(&blob).unwrap())
+    }
+
+    fn handle_variable(&self, meta: &ffi::CommandMeta, json: ffi::JsonBlob) {
+        self.get_sub()
+            .handle_variable(&meta.implementation_id, &meta.name, json.deserialize())
+            .unwrap();
+    }
+
+    pub fn publish_variable<T: serde::Serialize>(
+        &self,
+        impl_id: &str,
+        var_name: &str,
+        message: &T,
+    ) {
         let blob = ffi::JsonBlob::from_vec(
             serde_json::to_vec(&message).expect("Serialization of data cannot fail."),
         );
@@ -155,7 +189,7 @@ impl Publisher for Runtime {
             .publish_variable(impl_id, var_name, blob);
     }
 
-    fn call_command<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+    pub fn call_command<T: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
         impl_id: &str,
         name: &str,
@@ -170,75 +204,34 @@ impl Publisher for Runtime {
             .call_command(impl_id, name, blob);
         serde_json::from_slice(&return_value.data).unwrap()
     }
-}
-
-pub struct Runtime {
-    // There are two subtleties here:
-    // 1. We are handing out pointers to `sub_impl` to `cpp_module` for callbacks. The pointers
-    //    must must stay valid for as long as `cpp_module` is alive. Hence `sub_impl` must never
-    //    move in memory. Rust can model this through the Pin concept which upholds this guarantee.
-    //    We use a Box to put the object on the heap.
-    // 2. For the same reason, `sub_impl` should outlive `cpp_module`, hence should be dropped
-    //    after it. Rust drops fields in declaration order, hence `cpp_module` should come before
-    //    `sub_impl` in this struct.
-    cpp_module: cxx::UniquePtr<ffi::Module>,
-    sub_impl: Box<dyn Subscriber>,
-}
-
-/// The cpp_module is for Rust an opaque type - so Rust can't tell if it is safe
-/// to be accessed from multiple threads. We know that the c++ runtime is meant
-/// to be used concurrently.
-unsafe impl Sync for ffi::Module {}
-
-impl Runtime {
-    fn on_ready(&self) {
-        self.sub_impl.on_ready();
-    }
-
-    fn handle_command(&self, meta: &ffi::CommandMeta, json: ffi::JsonBlob) -> ffi::JsonBlob {
-        let blob = self
-            .sub_impl
-            .handle_command(
-                &self,
-                &meta.implementation_id,
-                &meta.name,
-                json.deserialize(),
-            )
-            .unwrap();
-        ffi::JsonBlob::from_vec(serde_json::to_vec(&blob).unwrap())
-    }
-
-    fn handle_variable(&self, meta: &ffi::CommandMeta, json: ffi::JsonBlob) {
-        self.sub_impl
-            .handle_variable(
-                &self,
-                &meta.implementation_id,
-                &meta.name,
-                json.deserialize(),
-            )
-            .unwrap();
-    }
 
     // TODO(hrapp): This function could use some error handling.
-    pub fn from_commandline(sub_impl: Box<dyn Subscriber>) -> Self {
+    pub fn new() -> Self {
         let args: Args = argh::from_env();
-        let mut cpp_module = ffi::create_module(
+        let cpp_module = ffi::create_module(
             &args.module,
             &args.prefix.to_string_lossy(),
             &args.conf.to_string_lossy(),
         );
-        let manifest_json = cpp_module.as_mut().unwrap().initialize();
-        let manifest: schema::Manifest = manifest_json.deserialize();
 
-        let module = Self {
+        Self {
             cpp_module,
-            sub_impl,
-        };
+            sub_impl: None,
+        }
+    }
+
+    pub fn set_subscriber(&mut self, sub_impl: Weak<dyn Subscriber>) {
+        if self.sub_impl.is_some() {
+            return;
+        }
+        self.sub_impl = Some(sub_impl);
+        let manifest_json = self.cpp_module.as_ref().unwrap().initialize();
+        let manifest: schema::Manifest = manifest_json.deserialize();
 
         // Implement all commands for all of our implementations, dispatch everything to the
         // GenericModule.
         for (implementation_id, implementation) in manifest.provides {
-            let interface_s = module.cpp_module.get_interface(&implementation.interface);
+            let interface_s = self.cpp_module.get_interface(&implementation.interface);
             let interface: schema::Interface = interface_s.deserialize();
             for (name, _) in interface.cmds {
                 let meta = ffi::CommandMeta {
@@ -246,17 +239,17 @@ impl Runtime {
                     name,
                 };
 
-                (module.cpp_module)
+                (self.cpp_module)
                     .as_ref()
                     .unwrap()
-                    .provide_command(&module, &meta);
+                    .provide_command(&&self, &meta);
             }
         }
 
         // Subscribe to all variables that might be of interest.
         // TODO(sirver): This looks very similar to the block above.
         for (implementation_id, provides) in manifest.requires {
-            let interface_s = module.cpp_module.get_interface(&provides.interface);
+            let interface_s = self.cpp_module.get_interface(&provides.interface);
             let interface: schema::Interface = interface_s.deserialize();
             for (name, _) in interface.vars {
                 // NOCOM(#sirver): Look into misc.cpp, create_setup_from_config to get the right
@@ -266,17 +259,16 @@ impl Runtime {
                     name,
                 };
 
-                (module.cpp_module)
+                (self.cpp_module)
                     .as_ref()
                     .unwrap()
-                    .subscribe_variable(&module, &meta);
+                    .subscribe_variable(&self, &meta);
             }
         }
 
         // Since users can choose to overwrite `on_ready`, we can call signal_ready right away.
         // TODO(sirver): There were some doubts if this strategy is too inflexible, discuss design
         // again.
-        (module.cpp_module).as_ref().unwrap().signal_ready(&module);
-        module
+        (self.cpp_module).as_ref().unwrap().signal_ready(&self);
     }
 }

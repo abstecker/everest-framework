@@ -46,7 +46,7 @@ JsonBlob Module::get_interface(rust::Str interface_name) const {
     return json2blob(interface_def);
 }
 
-JsonBlob Module::initialize() {
+JsonBlob Module::initialize() const {
     handle_->connect();
     handle_->spawn_main_loop_thread();
 
