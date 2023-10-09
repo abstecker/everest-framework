@@ -4,7 +4,8 @@ use argh::FromArgs;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Weak};
+use std::sync::RwLock;
+use std::sync::{Weak};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -148,28 +149,43 @@ pub trait Subscriber: Sync + Send {
 /// ownership hence is necessary to break possible ownership cycles.
 pub struct Runtime {
     cpp_module: cxx::UniquePtr<ffi::Module>,
-    sub_impl: Option<Weak<dyn Subscriber>>,
+    sub_impl: RwLock<Option<Weak<dyn Subscriber>>>,
 }
 
 impl Runtime {
-    fn get_sub(&self) -> Arc<dyn Subscriber> {
-        self.sub_impl.as_ref().unwrap().upgrade().unwrap()
-    }
-
     fn on_ready(&self) {
-        self.get_sub().on_ready();
+        self.sub_impl
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .on_ready();
     }
 
     fn handle_command(&self, meta: &ffi::CommandMeta, json: ffi::JsonBlob) -> ffi::JsonBlob {
         let blob = self
-            .get_sub()
+            .sub_impl
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .unwrap()
             .handle_command(&meta.implementation_id, &meta.name, json.deserialize())
             .unwrap();
         ffi::JsonBlob::from_vec(serde_json::to_vec(&blob).unwrap())
     }
 
     fn handle_variable(&self, meta: &ffi::CommandMeta, json: ffi::JsonBlob) {
-        self.get_sub()
+        self.sub_impl
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .unwrap()
             .handle_variable(&meta.implementation_id, &meta.name, json.deserialize())
             .unwrap();
     }
@@ -216,15 +232,13 @@ impl Runtime {
 
         Self {
             cpp_module,
-            sub_impl: None,
+            sub_impl: RwLock::new(None),
         }
     }
 
-    pub fn set_subscriber(&mut self, sub_impl: Weak<dyn Subscriber>) {
-        if self.sub_impl.is_some() {
-            return;
-        }
-        self.sub_impl = Some(sub_impl);
+    pub fn set_subscriber(&self, sub_impl: Weak<dyn Subscriber>) {
+
+        *self.sub_impl.write().unwrap() = Some(sub_impl);
         let manifest_json = self.cpp_module.as_ref().unwrap().initialize();
         let manifest: schema::Manifest = manifest_json.deserialize();
 
