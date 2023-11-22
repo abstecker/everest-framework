@@ -1,6 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug)]
 struct Libraries {
     everestrs_sys: PathBuf,
     framework: PathBuf,
@@ -95,9 +96,41 @@ fn find_libs(root: &Path) -> Libraries {
 }
 
 fn main() {
-    let root = find_everest_workspace_root();
-    let libs = find_libs(&root);
 
-    print_link_options(&libs.everestrs_sys);
-    print_link_options(&libs.framework);
+    match env::var("EVEREST_FRAMEWORK_LIB") {
+        Ok(everest_framework_path) => {
+            println!("Libraries were manually provided");
+            println!("Current path: {:?}", env::current_dir().unwrap());
+            let include_paths = &env::var("EVEREST_FRAMEWORK_INCLUDE_PATH")
+                            .expect("Please provide EVEREST_FRAMEWORK_INCLUDE_PATH as well");
+            println!("Include str: {:?}", include_paths);
+
+            let include_paths: Vec<_> = env::split_paths(include_paths).collect();
+            println!("Split items: {:?}", include_paths);
+            let include_paths: Vec<_> = include_paths
+                .iter()
+                .map(|p| std::fs::canonicalize(&p).expect(format!("Can not unwrap {:?}",p).as_str())).collect();
+            println!("Include paths: {:?}", include_paths);
+            cxx_build::bridge("src/lib.rs")
+                .file("src/everestrs_sys.cpp")
+                .includes(include_paths)
+                .flag("-std=c++17")
+                .compile("everstrs_sys");
+
+            println!("cargo:rerun-if-changed=src/lib.rs");
+            println!("cargo:rerun-if-changed=src/everestrs_sys.cpp");
+            println!("cargo:rerun-if-changed=src/everestrs_sys.hpp");
+            print_link_options(&PathBuf::from(everest_framework_path));
+        }
+        _ => {
+            println!("Libraries are now derived");
+            let root = find_everest_workspace_root();
+            let libs = find_libs(&root);
+
+            print_link_options(&libs.everestrs_sys);
+            print_link_options(&libs.framework);
+        }
+    };
+
+
 }
