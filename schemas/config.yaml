@@ -39,11 +39,15 @@ properties:
         type: string
       types_dir:
         type: string
+      errors_dir:
+        type: string
       www_dir:
         type: string
       logging_config_file:
         type: string
       controller_port:
+        type: integer
+      controller_rpc_timeout_ms:
         type: integer
       mqtt_broker_host:
         type: string
@@ -56,6 +60,8 @@ properties:
       telemetry_prefix:
         type: string
       telemetry_enabled:
+        type: boolean
+      validate_schema:
         type: boolean
     additionalProperties: false
   active_modules:

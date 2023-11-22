@@ -64,6 +64,7 @@ inline constexpr auto DATAROOT_DIR = "share";
 
 inline constexpr auto MODULES_DIR = "modules";
 inline constexpr auto TYPES_DIR = "types";
+inline constexpr auto ERRORS_DIR = "errors";
 inline constexpr auto INTERFACES_DIR = "interfaces";
 inline constexpr auto SCHEMAS_DIR = "schemas";
 inline constexpr auto CONFIG_NAME = "default.yaml";
@@ -72,12 +73,14 @@ inline constexpr auto LOGGING_CONFIG_NAME = "default_logging.cfg";
 inline constexpr auto WWW_DIR = "www";
 
 inline constexpr auto CONTROLLER_PORT = 8849;
+inline constexpr auto CONTROLLER_RPC_TIMEOUT_MS = 2000;
 inline constexpr auto MQTT_BROKER_HOST = "localhost";
 inline constexpr auto MQTT_BROKER_PORT = 1883;
 inline constexpr auto MQTT_EVEREST_PREFIX = "everest";
 inline constexpr auto MQTT_EXTERNAL_PREFIX = "";
 inline constexpr auto TELEMETRY_PREFIX = "everest-telemetry";
 inline constexpr auto TELEMETRY_ENABLED = false;
+inline constexpr auto VALIDATE_SCHEMA = false;
 
 } // namespace defaults
 
@@ -85,6 +88,7 @@ std::string parse_string_option(const boost::program_options::variables_map& vm,
 
 const auto TERMINAL_STYLE_ERROR = fmt::emphasis::bold | fg(fmt::terminal_color::red);
 const auto TERMINAL_STYLE_OK = fmt::emphasis::bold | fg(fmt::terminal_color::green);
+const auto TERMINAL_STYLE_BLUE = fmt::emphasis::bold | fg(fmt::terminal_color::blue);
 
 struct BootException : public std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -99,10 +103,12 @@ struct RuntimeSettings {
     fs::path modules_dir;
     fs::path interfaces_dir;
     fs::path types_dir;
+    fs::path errors_dir;
     fs::path logging_config_file;
     fs::path config_file;
     fs::path www_dir;
     int controller_port;
+    int controller_rpc_timeout_ms;
     std::string mqtt_broker_host;
     int mqtt_broker_port;
     std::string mqtt_everest_prefix;
@@ -118,7 +124,7 @@ struct RuntimeSettings {
 };
 
 // NOTE: this function needs the be called with a pre-initialized ModuleInfo struct
-void populate_module_info_path_from_runtime_settings(ModuleInfo&, const RuntimeSettings& rs);
+void populate_module_info_path_from_runtime_settings(ModuleInfo&, std::shared_ptr<RuntimeSettings> rs);
 
 struct ModuleCallbacks {
     std::function<void(ModuleAdapter module_adapter)> register_module_adapter;
@@ -136,7 +142,7 @@ struct ModuleCallbacks {
 
 class ModuleLoader {
 private:
-    std::unique_ptr<RuntimeSettings> runtime_settings;
+    std::shared_ptr<RuntimeSettings> runtime_settings;
     std::string module_id;
     std::string original_process_name;
     ModuleCallbacks callbacks;

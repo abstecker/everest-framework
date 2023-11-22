@@ -36,12 +36,13 @@ int main(int argc, char* argv[]) {
 
     Everest::Logging::init(config_params.at("logging_config_file"), "everest_ctrl");
 
-    EVLOG_info << "everest controller process started ...";
+    EVLOG_debug << "everest controller process started ...";
 
     CommandApi::Config config{
         config_params.at("module_dir"),
         config_params.at("interface_dir"),
         config_params.at("configs_dir"),
+        config_params.at("controller_rpc_timeout_ms"),
     };
 
     RPC rpc(socket_fd, config);

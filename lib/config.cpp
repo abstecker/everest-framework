@@ -2,6 +2,7 @@
 // Copyright 2020 - 2023 Pionix GmbH and Contributors to EVerest
 #include <algorithm>
 #include <fstream>
+#include <list>
 #include <set>
 #include <sstream>
 
@@ -10,6 +11,7 @@
 #include <everest/exceptions.hpp>
 #include <everest/logging.hpp>
 
+#include <framework/runtime.hpp>
 #include <utils/config.hpp>
 #include <utils/formatter.hpp>
 #include <utils/yaml_loader.hpp>
@@ -239,13 +241,13 @@ void Config::load_and_validate_manifest(const std::string& module_id, const json
     EVLOG_debug << fmt::format("Found module {}, loading and verifying manifest...", printable_identifier(module_id));
 
     // load and validate module manifest.json
-    fs::path manifest_path = fs::path(modules_dir) / module_name / "manifest.yaml";
+    fs::path manifest_path = this->rs->modules_dir / module_name / "manifest.yaml";
     try {
-        EVLOG_debug << fmt::format("Loading module manifest file at: {}", fs::canonical(manifest_path).string());
 
         if (module_name != "ProbeModule") {
             // FIXME (aw): this is implicit logic, because we know, that the ProbeModule manifest had been set up
             // manually already
+            EVLOG_debug << fmt::format("Loading module manifest file at: {}", fs::canonical(manifest_path).string());
             this->manifests[module_name] = load_yaml(manifest_path);
         }
 
@@ -364,42 +366,38 @@ void Config::load_and_validate_manifest(const std::string& module_id, const json
     }
 }
 
-Config::Config(std::string schemas_dir, std::string config_file, std::string modules_dir, std::string interfaces_dir,
-               std::string types_dir, const std::string& mqtt_everest_prefix, const std::string& mqtt_external_prefix) {
-    BOOST_LOG_FUNCTION();
+Config::Config(std::shared_ptr<RuntimeSettings> rs) : Config(rs, false) {
+}
 
-    this->schemas_dir = schemas_dir;
-    this->modules_dir = modules_dir;
-    this->interfaces_dir = interfaces_dir;
-    this->types_dir = types_dir;
-    this->mqtt_everest_prefix = mqtt_everest_prefix;
-    this->mqtt_external_prefix = mqtt_external_prefix;
+Config::Config(std::shared_ptr<RuntimeSettings> rs, bool manager) : rs(rs), manager(manager) {
+    BOOST_LOG_FUNCTION();
 
     this->manifests = json({});
     this->interfaces = json({});
     this->interface_definitions = json({});
     this->types = json({});
-
-    this->_schemas = Config::load_schemas(this->schemas_dir);
+    this->errors = json({});
+    this->_schemas = Config::load_schemas(this->rs->schemas_dir);
+    this->error_map = error::ErrorTypeMap(this->rs->errors_dir);
 
     // load and process config file
-    fs::path config_path = config_file;
+    fs::path config_path = rs->config_file;
 
     try {
-        EVLOG_debug << fmt::format("Loading config file at: {}", fs::canonical(config_path).string());
-
+        if (manager) {
+            EVLOG_info << fmt::format("Loading config file at: {}", fs::canonical(config_path).string());
+        }
         auto complete_config = load_yaml(config_path);
-
         // try to load user config from a directory "user-config" that might be in the same parent directory as the
         // config_file. The config is supposed to have the same name as the parent config.
         // TODO(kai): introduce a parameter that can overwrite the location of the user config?
         // TODO(kai): or should we introduce a "meta-config" that references all configs that should be merged here?
         auto user_config_path = config_path.parent_path() / "user-config" / config_path.filename();
         if (fs::exists(user_config_path)) {
-            EVLOG_debug << fmt::format("Loading user-config file at: {}", fs::canonical(user_config_path).string());
-
+            if (manager) {
+                EVLOG_info << fmt::format("Loading user-config file at: {}", fs::canonical(user_config_path).string());
+            }
             auto user_config = load_yaml(user_config_path);
-
             EVLOG_debug << "Augmenting main config with user-config entries";
             complete_config.merge_patch(user_config);
         } else {
@@ -421,28 +419,91 @@ Config::Config(std::string schemas_dir, std::string config_file, std::string mod
     }
 
     // load type files
-    auto types_path = fs::path(this->types_dir);
-    for (auto const& types_entry : fs::recursive_directory_iterator(types_path)) {
-        auto const& type_file_path = types_entry.path();
-        if (fs::is_regular_file(type_file_path) && type_file_path.extension() == ".yaml") {
-            auto type_path = std::string("/") + fs::relative(type_file_path, types_path).stem().string();
-            try {
-                // load and validate type file, store validated result in this->types
-                EVLOG_verbose << fmt::format("Loading type file at: {}", fs::canonical(type_file_path).c_str());
+    if (manager or rs->validate_schema) {
+        int total_time_validation_ms = 0, total_time_parsing_ms = 0;
+        for (auto const& types_entry : fs::recursive_directory_iterator(this->rs->types_dir)) {
+            auto start_time = std::chrono::system_clock::now();
+            auto const& type_file_path = types_entry.path();
+            if (fs::is_regular_file(type_file_path) && type_file_path.extension() == ".yaml") {
+                auto type_path = std::string("/") + fs::relative(type_file_path, this->rs->types_dir).stem().string();
 
-                json type_json = load_yaml(type_file_path);
-                json_validator validator(Config::loader, Config::format_checker);
-                validator.set_root_schema(this->_schemas.type);
-                validator.validate(type_json);
+                try {
+                    // load and validate type file, store validated result in this->types
+                    EVLOG_verbose << fmt::format("Loading type file at: {}", fs::canonical(type_file_path).c_str());
+                    json type_json = load_yaml(type_file_path);
+                    auto start_time_validate = std::chrono::system_clock::now();
+                    json_validator validator(Config::loader, Config::format_checker);
+                    validator.set_root_schema(this->_schemas.type);
+                    validator.validate(type_json);
+                    auto end_time_validate = std::chrono::system_clock::now();
+                    EVLOG_debug << "YAML validation of " << types_entry.path().string() << " took: "
+                                << std::chrono::duration_cast<std::chrono::milliseconds>(end_time_validate -
+                                                                                         start_time_validate)
+                                       .count()
+                                << "ms";
+                    total_time_validation_ms +=
+                        std::chrono::duration_cast<std::chrono::milliseconds>(end_time_validate - start_time_validate)
+                            .count();
 
-                this->types[type_path] = type_json["types"];
-            } catch (const std::exception& e) {
-                EVLOG_AND_THROW(EverestConfigError(fmt::format("Failed to load and parse type file '{}', reason: {}",
-                                                               type_file_path.string(), e.what())));
+                    this->types[type_path] = type_json["types"];
+                } catch (const std::exception& e) {
+                    EVLOG_AND_THROW(EverestConfigError(fmt::format(
+                        "Failed to load and parse type file '{}', reason: {}", type_file_path.string(), e.what())));
+                }
             }
+            auto end_time = std::chrono::system_clock::now();
+            total_time_parsing_ms +=
+                std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+            EVLOG_debug << "Parsing of type " << types_entry.path().string() << " took: "
+                        << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() << "ms";
         }
+        EVLOG_info << "- Types loaded in [" << total_time_parsing_ms - total_time_validation_ms << "ms]";
+        EVLOG_info << "- Types validated [" << total_time_validation_ms << "ms]";
     }
 
+    // load error files
+    if (manager or rs->validate_schema) {
+        int total_time_validation_ms = 0, total_time_parsing_ms = 0;
+        for (auto const& errors_entry : fs::recursive_directory_iterator(this->rs->errors_dir)) {
+            auto start_time = std::chrono::system_clock::now();
+            auto const& error_file_path = errors_entry.path();
+            if (fs::is_regular_file(error_file_path) && error_file_path.extension() == ".yaml") {
+                auto error_path =
+                    std::string("/") + fs::relative(error_file_path, this->rs->errors_dir).stem().string();
+
+                try {
+                    // load and validate error file, store validated result in this->errors
+                    EVLOG_verbose << fmt::format("Loading error file at: {}", fs::canonical(error_file_path).c_str());
+                    json error_json = load_yaml(error_file_path);
+                    auto start_time_validate = std::chrono::system_clock::now();
+                    json_validator validator(Config::loader, Config::format_checker);
+                    validator.set_root_schema(this->_schemas.error_declaration_list);
+                    validator.validate(error_json);
+                    auto end_time_validate = std::chrono::system_clock::now();
+                    EVLOG_debug << "YAML validation of " << errors_entry.path().string() << " took: "
+                                << std::chrono::duration_cast<std::chrono::milliseconds>(end_time_validate -
+                                                                                         start_time_validate)
+                                       .count()
+                                << "ms";
+                    total_time_validation_ms +=
+                        std::chrono::duration_cast<std::chrono::milliseconds>(end_time_validate - start_time_validate)
+                            .count();
+
+                    this->errors[error_path] = error_json["errors"];
+                } catch (const std::exception& e) {
+                    EVLOG_AND_THROW(EverestConfigError(fmt::format(
+                        "Failed to load and parse error file '{}', reason: {}", error_file_path.string(), e.what())));
+                }
+            }
+            auto end_time = std::chrono::system_clock::now();
+            total_time_parsing_ms +=
+                std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+            EVLOG_debug << "Parsing of error " << errors_entry.path().string() << " took: "
+                        << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() << "ms";
+        }
+        EVLOG_info << "- Errors loaded in [" << total_time_parsing_ms - total_time_validation_ms << "ms]";
+        EVLOG_info << "- Errors validated [" << total_time_validation_ms << "ms]";
+    }
     std::optional<std::string> probe_module_id;
 
     // load manifest files of configured modules
@@ -482,6 +543,10 @@ Config::Config(std::string schemas_dir, std::string config_file, std::string mod
     resolve_all_requirements();
 }
 
+error::ErrorTypeMap Config::get_error_map() const {
+    return this->error_map;
+}
+
 std::string Config::get_module_name(const std::string& module_id) {
     return this->module_names.at(module_id);
 }
@@ -503,9 +568,69 @@ json Config::resolve_interface(const std::string& intf_name) {
     return intf_definition;
 }
 
+std::list<json> Config::resolve_error_ref(const std::string& reference) {
+    BOOST_LOG_FUNCTION();
+    std::string ref_prefix = "/errors/";
+    std::string err_ref = reference.substr(ref_prefix.length());
+    auto result = err_ref.find("#/");
+    std::string err_namespace;
+    std::string err_name;
+    bool is_error_list;
+    if (result == std::string::npos) {
+        err_namespace = err_ref;
+        err_name = "";
+        is_error_list = true;
+    } else {
+        err_namespace = err_ref.substr(0, result);
+        err_name = err_ref.substr(result + 2);
+        is_error_list = false;
+    }
+    fs::path path = this->rs->errors_dir / (err_namespace + ".yaml");
+    json error_json = load_yaml(path);
+    std::list<json> errors;
+    if (is_error_list) {
+        for (auto& error : error_json.at("errors")) {
+            error["namespace"] = err_namespace;
+            errors.push_back(error);
+        }
+    } else {
+        for (auto& error : error_json.at("errors")) {
+            if (error.at("name") == err_name) {
+                error["namespace"] = err_namespace;
+                errors.push_back(error);
+                break;
+            }
+        }
+    }
+    return errors;
+}
+
+json Config::replace_error_refs(json& interface_json) {
+    BOOST_LOG_FUNCTION();
+    if (!interface_json.contains("errors")) {
+        return interface_json;
+    }
+    json errors_new = json::object();
+    for (auto& error_entry : interface_json.at("errors")) {
+        std::list<json> errors = resolve_error_ref(error_entry.at("reference"));
+        for (auto& error : errors) {
+            if (!errors_new.contains(error.at("namespace"))) {
+                errors_new[error.at("namespace")] = json::object();
+            }
+            if (errors_new.at(error.at("namespace")).contains(error.at("name"))) {
+                EVLOG_AND_THROW(EverestConfigError(fmt::format("Error name '{}' in namespace '{}' already referenced!",
+                                                               error.at("name"), error.at("namespace"))));
+            }
+            errors_new[error.at("namespace")][error.at("name")] = error;
+        }
+    }
+    interface_json["errors"] = errors_new;
+    return interface_json;
+}
+
 json Config::load_interface_file(const std::string& intf_name) {
     BOOST_LOG_FUNCTION();
-    fs::path intf_path = fs::path(this->interfaces_dir) / (intf_name + ".yaml");
+    fs::path intf_path = this->rs->interfaces_dir / (intf_name + ".yaml");
     try {
         EVLOG_debug << fmt::format("Loading interface file at: {}", fs::canonical(intf_path).string());
 
@@ -521,6 +646,7 @@ json Config::load_interface_file(const std::string& intf_name) {
             // extend config entry with default values
             interface_json = interface_json.patch(patch);
         }
+        interface_json = Config::replace_error_refs(interface_json);
 
         // validate every cmd arg/result and var definition against draft-07 schema
         validator.set_root_schema(draft07);
@@ -571,7 +697,7 @@ json Config::resolve_requirement(const std::string& module_id, const std::string
     return module_config["connections"][requirement_id];
 }
 
-bool Config::contains(const std::string& module_id) {
+bool Config::contains(const std::string& module_id) const {
     BOOST_LOG_FUNCTION();
     return this->main.contains(module_id);
 }
@@ -587,7 +713,7 @@ json Config::get_module_json_config(const std::string& module_id) {
     return this->main[module_id]["config_maps"];
 }
 
-ModuleConfigs Config::get_module_configs(const std::string& module_id) {
+ModuleConfigs Config::get_module_configs(const std::string& module_id) const {
     BOOST_LOG_FUNCTION();
     ModuleConfigs module_configs;
 
@@ -666,26 +792,28 @@ json Config::load_schema(const fs::path& path) {
     try {
         validator.set_root_schema(schema);
     } catch (const std::exception& e) {
-        EVLOG_AND_THROW(EverestInternalError(fmt::format("Validation of schema failed, here is why: {}", e.what())));
+        EVLOG_AND_THROW(EverestInternalError(
+            fmt::format("Validation of schema '{}' failed, here is why: {}", path.string(), e.what())));
     }
 
     return schema;
 }
 
-schemas Config::load_schemas(std::string schemas_dir) {
+schemas Config::load_schemas(const fs::path& schemas_dir) {
     BOOST_LOG_FUNCTION();
     schemas schemas;
 
-    EVLOG_debug << fmt::format("Loading base schema files for config and manifests... from: {}", schemas_dir);
-    schemas.config = Config::load_schema(fs::path(schemas_dir) / "config.yaml");
-    schemas.manifest = Config::load_schema(fs::path(schemas_dir) / "manifest.yaml");
-    schemas.interface = Config::load_schema(fs::path(schemas_dir) / "interface.yaml");
-    schemas.type = Config::load_schema(fs::path(schemas_dir) / "type.yaml");
+    EVLOG_debug << fmt::format("Loading base schema files for config and manifests... from: {}", schemas_dir.string());
+    schemas.config = Config::load_schema(schemas_dir / "config.yaml");
+    schemas.manifest = Config::load_schema(schemas_dir / "manifest.yaml");
+    schemas.interface = Config::load_schema(schemas_dir / "interface.yaml");
+    schemas.type = Config::load_schema(schemas_dir / "type.yaml");
+    schemas.error_declaration_list = Config::load_schema(schemas_dir / "error-declaration-list.yaml");
 
     return schemas;
 }
 
-json Config::load_all_manifests(std::string modules_dir, std::string schemas_dir) {
+json Config::load_all_manifests(const std::string& modules_dir, const std::string& schemas_dir) {
     BOOST_LOG_FUNCTION();
 
     json manifests = json({});
@@ -840,13 +968,13 @@ std::optional<TelemetryConfig> Config::get_telemetry_config(const std::string& m
 std::string Config::mqtt_prefix(const std::string& module_id, const std::string& impl_id) {
     BOOST_LOG_FUNCTION();
 
-    return fmt::format("{}{}/{}", this->mqtt_everest_prefix, module_id, impl_id);
+    return fmt::format("{}{}/{}", this->rs->mqtt_everest_prefix, module_id, impl_id);
 }
 
 std::string Config::mqtt_module_prefix(const std::string& module_id) {
     BOOST_LOG_FUNCTION();
 
-    return fmt::format("{}{}", this->mqtt_everest_prefix, module_id);
+    return fmt::format("{}{}", this->rs->mqtt_everest_prefix, module_id);
 }
 
 json Config::extract_implementation_info(const std::string& module_id, const std::string& impl_id) {

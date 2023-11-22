@@ -4,6 +4,7 @@
 #define UTILS_CONFIG_HPP
 
 #include <filesystem>
+#include <list>
 #include <optional>
 #include <regex>
 #include <set>
@@ -13,6 +14,7 @@
 #include <nlohmann/json-schema.hpp>
 
 #include <utils/config_cache.hpp>
+#include <utils/error.hpp>
 #include <utils/types.hpp>
 
 namespace Everest {
@@ -21,14 +23,16 @@ using json_uri = nlohmann::json_uri;
 using json_validator = nlohmann::json_schema::json_validator;
 namespace fs = std::filesystem;
 
+struct RuntimeSettings;
 ///
 /// \brief A structure that contains all available schemas
 ///
 struct schemas {
-    json config;    ///< The config schema
-    json manifest;  ///< The manifest scheme
-    json interface; ///< The interface schema
-    json type;      ///< The type schema
+    json config;                 ///< The config schema
+    json manifest;               ///< The manifest scheme
+    json interface;              ///< The interface schema
+    json type;                   ///< The type schema
+    json error_declaration_list; ///< The error-declaration-list schema
 };
 
 ///
@@ -41,12 +45,8 @@ const static std::regex type_uri_regex{R"(^((?:\/[a-zA-Z0-9\-\_]+)+#\/[a-zA-Z0-9
 ///
 class Config {
 private:
-    std::string schemas_dir;
-    std::string modules_dir;
-    std::string interfaces_dir;
-    std::string types_dir;
-    std::string mqtt_everest_prefix;
-    std::string mqtt_external_prefix;
+    std::shared_ptr<RuntimeSettings> rs;
+    bool manager;
 
     json main;
 
@@ -54,9 +54,22 @@ private:
     json interfaces;
     json interface_definitions;
     json types;
+    json errors;
     schemas _schemas;
 
     std::unordered_map<std::string, std::optional<TelemetryConfig>> telemetry_configs;
+
+    ///
+    /// \brief loads the contents of an error or an error list referenced by the given \p reference.
+    ///
+    /// \returns a list of json objects containing the error definitions
+    std::list<json> resolve_error_ref(const std::string& reference);
+
+    ///
+    /// \brief replaces all error references in the given \p interface_json with the actual error definitions
+    ///
+    /// \returns the interface_json with replaced error references
+    json replace_error_refs(json& interface_json);
 
     ///
     /// \brief loads the contents of the interface file referenced by the give \p intf_name from disk and validates its
@@ -93,16 +106,17 @@ private:
 
     void load_and_validate_manifest(const std::string& module_id, const json& module_config);
 
+    error::ErrorTypeMap error_map;
+
 public:
+    error::ErrorTypeMap get_error_map() const;
     std::string get_module_name(const std::string& module_id);
     bool module_provides(const std::string& module_name, const std::string& impl_id);
     json get_module_cmds(const std::string& module_name, const std::string& impl_id);
     ///
-    /// \brief creates a new Config object, looking for the config.json and schemes folder relative to the provided \p
-    /// main_dir
-    explicit Config(std::string schemas_dir, std::string config_file, std::string modules_dir,
-                    std::string interfaces_dir, std::string types_dir, const std::string& mqtt_everest_prefix,
-                    const std::string& mqtt_external_prefix);
+    /// \brief creates a new Config object
+    explicit Config(std::shared_ptr<RuntimeSettings> rs);
+    explicit Config(std::shared_ptr<RuntimeSettings> rs, bool manager);
 
     ///
     /// \brief checks if the given \p module_id provides the requirement given in \p requirement_id
@@ -113,7 +127,7 @@ public:
     ///
     /// \brief checks if the config contains the given \p module_id
     ///
-    bool contains(const std::string& module_id);
+    bool contains(const std::string& module_id) const;
 
     ///
     /// \returns a json object that contains the main config
@@ -122,7 +136,7 @@ public:
 
     ///
     /// \returns a map of module config options
-    ModuleConfigs get_module_configs(const std::string& module_id);
+    ModuleConfigs get_module_configs(const std::string& module_id) const;
 
     ///
     /// \returns a json object that contains the module config options
@@ -185,7 +199,7 @@ public:
     /// the provided \p schemas_dir
     ///
     /// \returns the config and manifest schemas
-    static schemas load_schemas(std::string schemas_dir);
+    static schemas load_schemas(const fs::path& schemas_dir);
 
     ///
     /// \brief loads and validates a json schema at the provided \p path
@@ -197,7 +211,7 @@ public:
     /// \brief loads all module manifests relative to the \p main_dir
     ///
     /// \returns all module manifests as a json object
-    static json load_all_manifests(std::string modules_dir, std::string schemas_dir);
+    static json load_all_manifests(const std::string& modules_dir, const std::string& schemas_dir);
 
     ///
     /// \brief Extracts the keys of the provided json \p object

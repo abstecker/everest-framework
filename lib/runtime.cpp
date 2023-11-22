@@ -2,6 +2,8 @@
 // Copyright 2020 - 2023 Pionix GmbH and Contributors to EVerest
 
 #include <framework/runtime.hpp>
+#include <utils/error.hpp>
+#include <utils/error_json.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -69,10 +71,10 @@ static std::string get_prefixed_path_from_json(const nlohmann::json& value, cons
     return settings_configs_dir;
 }
 
-void populate_module_info_path_from_runtime_settings(ModuleInfo& mi, const RuntimeSettings& rs) {
-    mi.paths.etc = rs.etc_dir;
-    mi.paths.libexec = rs.modules_dir / mi.name;
-    mi.paths.share = rs.data_dir / defaults::MODULES_DIR / mi.name;
+void populate_module_info_path_from_runtime_settings(ModuleInfo& mi, std::shared_ptr<RuntimeSettings> rs) {
+    mi.paths.etc = rs->etc_dir;
+    mi.paths.libexec = rs->modules_dir / mi.name;
+    mi.paths.share = rs->data_dir / defaults::MODULES_DIR / mi.name;
 }
 
 RuntimeSettings::RuntimeSettings(const std::string& prefix_, const std::string& config_) {
@@ -208,6 +210,15 @@ RuntimeSettings::RuntimeSettings(const std::string& prefix_, const std::string& 
         types_dir = assert_dir(default_types_dir, "Default type directory");
     }
 
+    const auto settings_errors_dir_it = settings.find("errors_dir");
+    if (settings_errors_dir_it != settings.end()) {
+        const auto settings_errors_dir = get_prefixed_path_from_json(*settings_errors_dir_it, prefix);
+        errors_dir = assert_dir(settings_errors_dir, "Config provided error directory");
+    } else {
+        const auto default_errors_dir = data_dir / defaults::ERRORS_DIR;
+        errors_dir = assert_dir(default_errors_dir, "Default error directory");
+    }
+
     const auto settings_www_dir_it = settings.find("www_dir");
     if (settings_www_dir_it != settings.end()) {
         const auto settings_www_dir = get_prefixed_path_from_json(*settings_www_dir_it, prefix);
@@ -238,6 +249,13 @@ RuntimeSettings::RuntimeSettings(const std::string& prefix_, const std::string& 
         controller_port = settings_controller_port_it->get<int>();
     } else {
         controller_port = defaults::CONTROLLER_PORT;
+    }
+
+    const auto settings_controller_rpc_timeout_ms_it = settings.find("controller_rpc_timeout_ms");
+    if (settings_controller_rpc_timeout_ms_it != settings.end()) {
+        controller_rpc_timeout_ms = settings_controller_rpc_timeout_ms_it->get<int>();
+    } else {
+        controller_rpc_timeout_ms = defaults::CONTROLLER_RPC_TIMEOUT_MS;
     }
 
     const auto settings_mqtt_broker_host_it = settings.find("mqtt_broker_host");
@@ -310,7 +328,13 @@ RuntimeSettings::RuntimeSettings(const std::string& prefix_, const std::string& 
     } else {
         telemetry_enabled = defaults::TELEMETRY_ENABLED;
     }
-    validate_schema = false;
+
+    const auto settings_validate_schema_it = settings.find("validate_schema");
+    if (settings_validate_schema_it != settings.end()) {
+        validate_schema = settings_validate_schema_it->get<bool>();
+    } else {
+        validate_schema = defaults::VALIDATE_SCHEMA;
+    }
 }
 
 ModuleCallbacks::ModuleCallbacks(const std::function<void(ModuleAdapter module_adapter)>& register_module_adapter,
@@ -328,18 +352,15 @@ ModuleLoader::ModuleLoader(int argc, char* argv[], ModuleCallbacks callbacks) :
 }
 
 int ModuleLoader::initialize() {
+    auto start_time = std::chrono::system_clock::now();
     if (!this->runtime_settings) {
         return 0;
     }
 
     auto& rs = this->runtime_settings;
-
     Logging::init(rs->logging_config_file.string(), this->module_id);
-
     try {
-        Config config = Config(rs->schemas_dir.string(), rs->config_file.string(), rs->modules_dir.string(),
-                               rs->interfaces_dir.string(), rs->types_dir.string(), rs->mqtt_everest_prefix,
-                               rs->mqtt_external_prefix);
+        Config config = Config(rs);
 
         if (!config.contains(this->module_id)) {
             EVLOG_error << fmt::format("Module id '{}' not found in config!", this->module_id);
@@ -384,6 +405,38 @@ int ModuleLoader::initialize() {
             return everest.subscribe_var(req, var_name, callback);
         };
 
+        module_adapter.subscribe_error = [&everest](const Requirement& req, const std::string& error_type,
+                                                    const error::ErrorCallback& error_callback) {
+            JsonCallback json_callback = [error_callback](json j) { error_callback(error::json_to_error(j)); };
+            return everest.subscribe_error(req, error_type, json_callback);
+        };
+
+        module_adapter.subscribe_error_cleared = [&everest](const Requirement& req, const std::string& error_type,
+                                                            const error::ErrorCallback& error_callback) {
+            JsonCallback json_callback = [error_callback](json j) { return error_callback(error::json_to_error(j)); };
+            return everest.subscribe_error_cleared(req, error_type, json_callback);
+        };
+
+        module_adapter.raise_error = [&everest](const std::string& impl_id, const std::string& type,
+                                                const std::string& message, const error::Severity& severity) {
+            return error::ErrorHandle(everest.raise_error(impl_id, type, message, error::severity_to_string(severity)));
+        };
+
+        module_adapter.request_clear_all_errors_of_module = [&everest](const std::string& impl_id) {
+            return everest.request_clear_error(error::RequestClearErrorOption::ClearAllOfModule, impl_id, "", "");
+        };
+
+        module_adapter.request_clear_all_errors_of_type_of_module = [&everest](const std::string& impl_id,
+                                                                               const std::string& error_type) {
+            return everest.request_clear_error(error::RequestClearErrorOption::ClearAllOfTypeOfModule, impl_id, "",
+                                               error_type);
+        };
+
+        module_adapter.request_clear_error_uuid = [&everest](const std::string& impl_id,
+                                                             const error::ErrorHandle& handle) {
+            return everest.request_clear_error(error::RequestClearErrorOption::ClearUUID, impl_id, handle.uuid, "");
+        };
+
         // NOLINTNEXTLINE(modernize-avoid-bind): prefer bind here for readability
         module_adapter.ext_mqtt_publish =
             std::bind(&Everest::Everest::external_mqtt_publish, &everest, std::placeholders::_1, std::placeholders::_2);
@@ -409,7 +462,7 @@ int ModuleLoader::initialize() {
 
         auto module_configs = config.get_module_configs(this->module_id);
         auto module_info = config.get_module_info(this->module_id);
-        populate_module_info_path_from_runtime_settings(module_info, *rs);
+        populate_module_info_path_from_runtime_settings(module_info, rs);
         module_info.telemetry_enabled = everest.is_telemetry_enabled();
 
         this->callbacks.init(module_configs, module_info);
@@ -422,6 +475,10 @@ int ModuleLoader::initialize() {
 
         // the module should now be ready
         everest.signal_ready();
+
+        auto end_time = std::chrono::system_clock::now();
+        EVLOG_info << "Module " << fmt::format(TERMINAL_STYLE_BLUE, "{}", module_id) << " initialized ["
+                   << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() << "ms]";
 
         everest.wait_for_main_loop_end();
 
